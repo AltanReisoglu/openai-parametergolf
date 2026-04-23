@@ -103,7 +103,7 @@ class Hyperparameters:
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "mamba_scale,attn_scale,mlp_scale,diff_lambda,resid_mix,skip_weights,smear,ve_layer_scales,ve_shared.scale",
+        "mamba_scale,attn_scale,mlp_scale,diff_lambda,resid_mix,skip_weights,skip_gates,smear,ve_layer_scales,ve_shared.scale",
     ).split(",") if p
 )
 
@@ -148,12 +148,27 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
+                        state["v_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
+                    v_buf = state["v_buffer"]
+                    
+                    # 1 & 2: Update first momentum (M_t = beta * M_{t-1} + G_t)
                     buf.mul_(momentum).add_(g)
-                    if nesterov: g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr:curr + p.numel()] = g.reshape(-1)
+                    
+                    # 3: Compute sign-stabilized orthogonal direction (O_t)
+                    O_t = zeropower_via_newtonschulz5(torch.sign(buf), steps=backend_steps)
+                    
+                    # 4: Update second momentum (V_t = beta * V_{t-1} + (1 - beta) * O_t^2)
+                    v_buf.mul_(momentum).addcmul_(O_t, O_t, value=1.0 - momentum)
+                    
+                    # 5: Apply second momentum update
+                    O_hat = O_t / (v_buf.sqrt() + 1e-8)
+                    
+                    # 6: RMS-aligned constraint
+                    gamma = 0.2 * (O_hat.numel() ** 0.5) / (O_hat.float().norm() + 1e-8)
+                    
+                    g_out = gamma * O_hat
+                    updates_flat[curr:curr + p.numel()] = g_out.reshape(-1)
                 curr += p.numel()
             if distributed: dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
@@ -271,7 +286,7 @@ class TernaryLinear(nn.Linear):
 class NormedTernaryLinear(TernaryLinear):
     def __init__(self, in_features, out_features, bias=False, group_size=64):
         super().__init__(in_features, out_features, bias=bias, group_size=group_size)
-        self.rms=nn.RMSNorm(self.group_in)
+        self.rms=RMSNorm()
     def forward(self, x: Tensor) -> Tensor:
         return super().forward(F.rms_norm(x, (x.size(-1),)))
 
@@ -281,7 +296,7 @@ class GroupedTernaryLinear(nn.Module):
         self.groups, self.group_in, self.group_out = groups, in_features // groups, out_features // groups
         self.group_size, self.normed = group_size, normed
         self.weight = nn.Parameter(torch.randn(groups * self.group_out, self.group_in) * 0.02)
-        self.rms=nn.RMSNorm(self.group_in)
+        self.rms=RMSNorm()
     def forward(self, x: Tensor) -> Tensor:
         if self.normed: x = self.rms(x)
         w = self.weight.bfloat16()
@@ -337,7 +352,7 @@ class CausalSelfAttention(nn.Module):
         self.diff_lambda = nn.Parameter(torch.full((num_heads,), 0.5, dtype=torch.float32))
         self.rope_dims = 0
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
-        self.rms=nn.RMSNorm(self.head_dim)
+        self.rms=RMSNorm()
     def forward(self, x, v_embed=None):
         bsz, seqlen, dim = x.shape
         q_out, k_out, v_out = self.c_qkv(x).split([self.num_heads * self.head_dim, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
@@ -346,7 +361,7 @@ class CausalSelfAttention(nn.Module):
         k_reshaped = k_out.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         k = self.rms(k_reshaped)
         v = v_out.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        if v_embed is not None: v = v + v_embed
+        if v_embed is not None: v = v + v_embed.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q, k = apply_rotary_emb(q, cos, sin, self.rope_dims), apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
@@ -426,12 +441,17 @@ class TransformerBlock(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        self.parallel = False
     def forward(self, x, x0, v_embed=None):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        return x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
+        if self.parallel:
+            mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
+            return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
+        else:
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            return x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
 
 def ternary_ste_hook(module, args):
     w = module.weight.bfloat16()
@@ -447,8 +467,6 @@ class MambaBlock(nn.Module):
         self.norm = RMSNorm()
         if Mamba2 is None: raise ImportError("Mamba2 not found. Please pip install mamba-ssm causal-conv1d")
         self.mamba = Mamba2(d_model=dim, d_state=128, headdim=64, chunk_size=256, dtype=torch.bfloat16)
-        for m in self.mamba.modules():
-            if isinstance(m, nn.Linear): m.register_forward_pre_hook(ternary_ste_hook)
         self.mamba_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
@@ -456,7 +474,7 @@ class MambaBlock(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         norm_x = self.norm(x_in) * self.ln_scale_factor
-        if v_embed is not None: norm_x = norm_x + v_embed
+        if v_embed is not None: norm_x = norm_x + F.pad(v_embed, (0, norm_x.size(-1) - v_embed.size(-1)))
         return x_in + self.mamba_scale.to(dtype=x_in.dtype)[None, None, :] * self.mamba(norm_x)
 
 # ─── GPT MODEL (U-Net + XSA + ValueEmbed + SmearGate + BigramHash) ──────────
@@ -482,6 +500,7 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             MambaBlock(model_dim, layer_idx=i, ln_scale=ln_scale) if i % 2 == 0 else
             TransformerBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i, ln_scale=ln_scale, activation=activation)
@@ -498,7 +517,7 @@ class GPT(nn.Module):
         if self.ve_layer_indices:
             self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
             self.ve_layer_scales = nn.ParameterList(
-                [nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices])
+                [nn.Parameter(torch.ones(kv_dim, dtype=torch.float32)) for _ in self.ve_layer_indices])
         else:
             self.ve_shared = None; self.ve_layer_scales = nn.ParameterList()
         self.final_norm = RMSNorm()
@@ -511,6 +530,9 @@ class GPT(nn.Module):
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 if hasattr(self.blocks[i], 'attn'):
                     self.blocks[i].attn.use_xsa = True
+        for i in range(len(self.blocks)):
+            if i >= 7 and hasattr(self.blocks[i], 'parallel'):
+                self.blocks[i].parallel = True
         self._init_weights()
 
     def _init_weights(self):
@@ -560,7 +582,9 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                x = torch.lerp(scaled_skip, x, g)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0, v_embed=ve)
         x = self.final_norm(x)
@@ -597,7 +621,10 @@ class GPT(nn.Module):
             x = self.blocks[i](x, x0, v_embed=ve); skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
-            if skips: x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            if skips:
+                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                x = torch.lerp(scaled_skip, x, g)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0, v_embed=ve)
         x = self.final_norm(x)
@@ -932,7 +959,7 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if 8 % world_size != 0: raise ValueError(f"WORLD_SIZE={world_size} must divide 8")
-    grad_accum_steps = 8 // world_size; grad_scale = 1.0 / grad_accum_steps
+    grad_accum_steps = 64 // world_size; grad_scale = 1.0 / grad_accum_steps
     device = torch.device("cuda", local_rank); torch.cuda.set_device(device)
     if distributed: dist.init_process_group(backend="nccl", device_id=device); dist.barrier()
     master_process = rank == 0
@@ -987,6 +1014,7 @@ def main():
         matrix_params.extend([p for p in base_model.mtp_heads.parameters() if p.ndim == 2])
     scalar_params = [p for n, p in block_named_params if p.ndim != 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
     if base_model.skip_weights.numel() > 0: scalar_params.append(base_model.skip_weights)
+    if getattr(base_model, 'skip_gates', None) is not None and base_model.skip_gates.numel() > 0: scalar_params.append(base_model.skip_gates)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None: scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
