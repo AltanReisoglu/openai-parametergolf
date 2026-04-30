@@ -27,6 +27,32 @@ try:
     from mamba_ssm import Mamba2
 except ImportError:
     Mamba2 = None
+from dataclasses import dataclass
+
+@dataclass
+class CSAConfig:
+    """Scaled-down configuration for Colab. Paper values in comments."""
+
+    # --- Attention dimensions ---
+    d: int = 256            # Hidden size                        (paper: 4096)
+    c: int = 64             # KV / attention head dimension      (paper: 192)
+    d_c: int = 128          # Query compression dimension        (paper: ~512)
+    n_h: int = 8            # Attention query heads              (paper: 128)
+    n_h_I: int = 4          # Indexer heads                      (paper: ~16)
+    c_I: int = 32           # Indexer head dimension             (paper: ~64)
+    m: int = 4              # Compression rate                   (paper: 4)
+    top_k: int = 8          # Sparse selection top-k             (paper: 512)
+    n_win: int = 32         # Sliding window size                (paper: 128)
+    g: int = 2              # Output projection groups           (paper: ~8)
+    d_g: int = 64           # Group intermediate dimension       (paper: ~256)
+    n_rope: int = 16        # Partial RoPE dimensions            (paper: 64)
+
+    # --- Transformer ---
+    n_layers: int = 4
+    vocab_size: int = 10000
+    max_seq_len: int = 2048
+    ffn_hidden: int = 1024
+    dropout: float = 0.0
 
 # ─── HYPERPARAMETERS ─────────────────────────────────────────────────────────
 class Hyperparameters:
@@ -99,6 +125,15 @@ class Hyperparameters:
     ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    # Looping / Depth Recurrence Config
+    num_loops = int(os.environ.get("NUM_LOOPS", 2))
+    loop_start = int(os.environ.get("LOOP_START", 3))
+    loop_end = int(os.environ.get("LOOP_END", 5))
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))
+    
+    # Self-Distillation Config
+    self_distil = bool(int(os.environ.get("SELF_DISTIL", "1")))
+    distil_weight = float(os.environ.get("DISTIL_WEIGHT", 0.3))
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     p for p in os.environ.get(
@@ -369,8 +404,335 @@ class CausalSelfAttention(nn.Module):
         y1 = flash_attn_3_func(q[..., :half].contiguous(), k[..., :half].contiguous(), v[..., :half].contiguous(), causal=True)
         y2 = flash_attn_3_func(q[..., half:].contiguous(), k[..., half:].contiguous(), v[..., half:].contiguous(), causal=True)
         lam = self.diff_lambda.to(dtype=y1.dtype)[None, None, :, None]
-        return self.proj(torch.cat([y1 - lam * y2, y1 + lam * y2], dim=-1).reshape(bsz, seqlen, dim))
+        
+        Y = torch.cat([y1 - lam * y2, y1 + lam * y2], dim=-1)
+        
+        # XSA Projection
+        Vn = F.normalize(v, dim=-1)
+        Y = Y - (Y * Vn).sum(dim=-1, keepdim=True) * Vn
+        
+        return self.proj(Y.reshape(bsz, seqlen, dim))
 
+
+class TokenLevelCompressor(nn.Module):
+    """
+    Compresses every m tokens into one entry via overlapped weighted average.
+    Paper Eqs. 9-12.
+    """
+
+    def __init__(self, d: int, out_dim: int, m: int):
+        super().__init__()
+        self.m = m
+        self.out_dim = out_dim
+
+        self.W_a_KV = TernaryLinear(d, out_dim, bias=False)       # Eq. 9
+        self.W_b_KV = TernaryLinear(d, out_dim, bias=False)
+        self.W_a_Z  = TernaryLinear(d, out_dim, bias=False)       # Eq. 10
+        self.W_b_Z  = TernaryLinear(d, out_dim, bias=False)
+
+        self.B_a = nn.Parameter(torch.zeros(m, out_dim))       # positional bias
+        self.B_b = nn.Parameter(torch.zeros(m, out_dim))
+
+    def forward(self, H: torch.Tensor) -> torch.Tensor:
+        """H: [batch, n, d] (n divisible by m)  ->  [batch, n//m, out_dim]"""
+        B, n, _ = H.shape
+        m = self.m
+        nb = n // m
+
+        C_a = self.W_a_KV(H).reshape(B, nb, m, -1)            # [B, nb, m, od]
+        C_b = self.W_b_KV(H).reshape(B, nb, m, -1)
+        Z_a = self.W_a_Z(H).reshape(B, nb, m, -1)
+        Z_b = self.W_b_Z(H).reshape(B, nb, m, -1)
+
+        # Overlapped: block i uses C_b from block i-1
+        # Block 0: pad C_b with zeros, Z_b with -inf  (paper below Eq. 12)
+        C_b_shift = F.pad(C_b[:, :-1], (0, 0, 0, 0, 1, 0))
+        Z_b_shift = F.pad(Z_b[:, :-1], (0, 0, 0, 0, 1, 0), value=float('-inf'))
+
+        # Add learnable positional biases
+        Z_a_bias = Z_a + self.B_a                              # broadcast [m, od]
+        Z_b_bias = Z_b_shift + self.B_b
+
+        # Eq. 11: row-wise softmax over 2m positions (independently per feature)
+        Z_cat = torch.cat([Z_a_bias, Z_b_bias], dim=2)        # [B, nb, 2m, od]
+        S = F.softmax(Z_cat, dim=2)
+        S_a, S_b = S[:, :, :m], S[:, :, m:]
+
+        # Eq. 12: Hadamard-product weighted sum
+        C_comp = (S_a * C_a).sum(dim=2) + (S_b * C_b_shift).sum(dim=2)
+        return C_comp
+        
+class LightningIndexer(nn.Module):
+    """
+    Per-query index scores and top-k selection of compressed KV blocks.
+    Paper Eqs. 13-17.
+    """
+
+    def __init__(self, cfg: CSAConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.W_DQ  = TernaryLinear(cfg.d,   cfg.d_c,              bias=False)  # Eq. 13
+        self.W_IUQ = TernaryLinear(cfg.d_c, cfg.n_h_I * cfg.c_I,  bias=False)  # Eq. 14
+        self.W_w   = TernaryLinear(cfg.d,   cfg.n_h_I,            bias=False)  # Eq. 15
+
+    def forward(
+        self, H: torch.Tensor, K_I_comp: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        H:        [B, n, d]
+        K_I_comp: [B, nb, c_I]
+        Returns:
+            c_Q:              [B, n, d_c]     shared compressed latent queries
+            selected_indices: [B, n, top_k']  per-query block indices
+        """
+        cfg = self.cfg
+        B, n, _ = H.shape
+        nb = K_I_comp.shape[1]
+
+        # Eq. 13: shared query compression
+        c_Q = self.W_DQ(H)                                        # [B, n, d_c]
+
+        # Eq. 14: indexer queries
+        q_I = self.W_IUQ(c_Q).reshape(B, n, cfg.n_h_I, cfg.c_I)  # [B,n,nh_I,c_I]
+
+        # Eq. 15: indexer head weights
+        w_I = self.W_w(H)                                         # [B, n, nh_I]
+
+        # Eq. 16: per-head dot product -> ReLU -> weighted sum
+        scores = torch.einsum('bnhc,bsc->bnhs', q_I, K_I_comp)   # [B,n,nh_I,nb]
+        scores = F.relu(scores)
+        index_scores = (w_I.unsqueeze(-1) * scores).sum(dim=2)    # [B, n, nb]
+
+        # Causality: token t may only see blocks s < floor(t / m)
+        tok_pos = torch.arange(n,  device=H.device)
+        blk_idx = torch.arange(nb, device=H.device)
+        causal = blk_idx.unsqueeze(0) < (tok_pos // cfg.m).unsqueeze(1)
+        index_scores = index_scores.masked_fill(~causal.unsqueeze(0), float('-inf'))
+
+        # Eq. 17: top-k
+        k = min(cfg.top_k, nb)
+        _, sel = torch.topk(index_scores, k=k, dim=-1)            # [B, n, k]
+        return c_Q, sel        # [B, nb, od]                                   
+        
+def apply_rope(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    n_rope: int,
+) -> torch.Tensor:
+    """
+    Apply Rotary Positional Embedding to the last n_rope dimensions of x.
+    """
+    assert n_rope % 2 == 0
+    x_pass = x[..., :-n_rope]
+    x_rope = x[..., -n_rope:]
+
+    half = n_rope // 2
+    freqs = 1.0 / (10000.0 ** (torch.arange(0, n_rope, 2,
+                    device=x.device, dtype=torch.float32) / n_rope))
+    angles = positions.unsqueeze(-1).float() * freqs
+
+    cos_a = torch.cos(angles)
+    sin_a = torch.sin(angles)
+
+    x1 = x_rope[..., :half]
+    x2 = x_rope[..., half:]
+
+    x_rot = torch.cat([x1 * cos_a - x2 * sin_a,
+                        x1 * sin_a + x2 * cos_a], dim=-1)
+    return torch.cat([x_pass, x_rot], dim=-1)
+
+class SlidingWindowKV(nn.Module):
+    """
+    Uncompressed KV entries for the n_win most recent tokens.
+    Paper Section 2.3.3.
+    """
+    def __init__(self, d: int, c: int):
+        super().__init__()
+        self.proj = TernaryLinear(d, c, bias=False)
+
+    def forward(
+        self, H: torch.Tensor, n_win: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            kv_sw:    [B, n, n_win, c]   sliding-window KV entries
+            sw_pos:   [B, n, n_win]      absolute positions for RoPE
+            sw_valid: [B, n, n_win]      True where the entry is real
+        """
+        B, n, _ = H.shape
+        kv_all = self.proj(H)                                    # [B, n, c]
+
+        # Left-pad so unfold gives a causal window ending at t (inclusive)
+        kv_pad = F.pad(kv_all, (0, 0, n_win - 1, 0))            # [B, n+win-1, c]
+        kv_sw = kv_pad.unfold(1, n_win, 1).permute(0, 1, 3, 2)  # [B, n, win, c]
+
+        # Absolute positions of window entries
+        t = torch.arange(n, device=H.device).unsqueeze(1)
+        off = torch.arange(n_win, device=H.device).unsqueeze(0)
+        pos = t - (n_win - 1) + off                              # [n, win]
+        valid = pos >= 0
+        pos = pos.clamp(min=0)
+
+        kv_sw = kv_sw * valid.unsqueeze(0).unsqueeze(-1).float()
+        return (kv_sw,
+                pos.unsqueeze(0).expand(B, -1, -1),
+                valid.unsqueeze(0).expand(B, -1, -1))
+
+class CoreAttentionWithSink(nn.Module):
+    """
+    Shared-KV Multi-Query Attention with QK norm, partial RoPE,
+    attention sink (Eq. 27), and inverse RoPE on output.
+    Paper Eqs. 18-19, 27, Section 2.3.3.
+    """
+
+    def __init__(self, cfg: CSAConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.W_UQ = TernaryLinear(cfg.d_c, cfg.n_h * cfg.c, bias=False)  # Eq. 18
+        self.q_norm = RMSNorm(cfg.c)
+        self.k_norm = RMSNorm(cfg.c)
+        self.sink_logits = nn.Parameter(torch.zeros(cfg.n_h))         # Eq. 27
+
+    def forward(
+        self,
+        c_Q: torch.Tensor,       # [B, n, d_c]
+        KV: torch.Tensor,        # [B, n, n_kv, c]
+        kv_pos: torch.Tensor,    # [B, n, n_kv]
+        q_pos: torch.Tensor,     # [B, n]
+        mask: Optional[torch.Tensor] = None,  # [B, n, n_kv] bool
+    ) -> torch.Tensor:
+        """Returns: o [B, n, n_h, c]"""
+        cfg = self.cfg
+        B, n, _ = c_Q.shape
+        n_kv = KV.shape[2]
+
+        # Eq. 18: queries from shared latent
+        q = self.W_UQ(c_Q).reshape(B, n, cfg.n_h, cfg.c)
+
+        # Partial RoPE (last n_rope dims) on queries and KV
+        q = apply_rope(q, q_pos.unsqueeze(2).expand(-1, -1, cfg.n_h), cfg.n_rope)
+        KV_roped = apply_rope(KV, kv_pos, cfg.n_rope)
+
+        # QK normalization (Section 2.3.3)
+        q = self.q_norm(q)
+        KV_normed = self.k_norm(KV_roped)
+
+        # Scaled dot-product (MQA: all query heads vs single KV head)
+        logits = torch.einsum('bnhc,bnkc->bnhk', q, KV_normed)
+        logits = logits / math.sqrt(cfg.c)
+
+        if mask is not None:
+            logits = logits.masked_fill(~mask.unsqueeze(2), float('-inf'))
+
+        # Eq. 27: attention sink  exp(z'_h) in denominator
+        lmax = logits.max(dim=-1, keepdim=True).values.detach()
+        exp_l = torch.exp(logits - lmax)
+
+        sink_shift = self.sink_logits.reshape(1, 1, cfg.n_h) - lmax.squeeze(-1)
+        exp_sink = torch.exp(sink_shift).unsqueeze(-1)
+
+        attn = exp_l / (exp_l.sum(dim=-1, keepdim=True) + exp_sink)
+
+        # Eq. 19: weighted sum (value = RoPE'd KV, shared KV serves as both K and V)
+        o = torch.einsum('bnhk,bnkc->bnhc', attn, KV_roped)
+
+        # XSA Projection
+        # Project out the self-value component from the attention output
+        # The self-value is the last element in the sliding window of KV_roped
+        v_self = KV_roped[:, :, -1, :] # [B, n, c]
+        Vn = F.normalize(v_self.unsqueeze(2), dim=-1) # [B, n, 1, c]
+        o = o - (o * Vn).sum(dim=-1, keepdim=True) * Vn
+
+        # Inverse RoPE on output (Section 2.3.3: position -t)
+        o = apply_rope(o, -q_pos.unsqueeze(2).expand(-1, -1, cfg.n_h), cfg.n_rope)
+        return o
+
+class GroupedOutputProjection(nn.Module):
+    """
+    Grouped output projection.  Paper Section 2.3.1.
+    Split n_h heads into g groups, project each group, then final projection.
+    """
+
+    def __init__(self, cfg: CSAConfig):
+        super().__init__()
+        self.cfg = cfg
+        hpg = cfg.n_h // cfg.g
+        gin = cfg.c * hpg
+
+        self.group_proj = nn.ModuleList(
+            [TernaryLinear(gin, cfg.d_g, bias=False) for _ in range(cfg.g)])
+        self.out_proj = TernaryLinear(cfg.d_g * cfg.g, cfg.d, bias=False)
+
+    def forward(self, o: torch.Tensor) -> torch.Tensor:
+        """o: [B, n, n_h, c] -> [B, n, d]"""
+        cfg = self.cfg
+        B, n, nh, c = o.shape
+        hpg = nh // cfg.g
+
+        o_grp = o.reshape(B, n, cfg.g, hpg * c)
+        parts = [self.group_proj[i](o_grp[:, :, i]) for i in range(cfg.g)]
+        return self.out_proj(torch.cat(parts, dim=-1))
+        
+class CSALayer(nn.Module):
+    """Complete Compressed Sparse Attention layer.  Paper Figure 3."""
+
+    def __init__(self, cfg: CSAConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.norm = RMSNorm(cfg.d)
+
+        self.kv_compressor     = TokenLevelCompressor(cfg.d, cfg.c,   cfg.m)
+        self.indexer_compressor = TokenLevelCompressor(cfg.d, cfg.c_I, cfg.m)
+        self.indexer            = LightningIndexer(cfg)
+        self.sliding_window    = SlidingWindowKV(cfg.d, cfg.c)
+        self.core_attn         = CoreAttentionWithSink(cfg)
+        self.out_proj          = GroupedOutputProjection(cfg)
+
+    def forward(self, H: torch.Tensor) -> torch.Tensor:
+        """H: [B, n, d] -> [B, n, d]"""
+        cfg = self.cfg
+        B, n, d = H.shape
+        m = cfg.m
+        nb = n // m
+
+        x = self.norm(H)
+        # 1. Compress KV entries (Eqs. 9-12)
+        C_comp = self.kv_compressor(x)                          # [B, nb, c]
+
+        # 2. Compress indexer keys (same algo, separate weights)
+        K_I_comp = self.indexer_compressor(x)                   # [B, nb, c_I]
+
+        # 3. Lightning indexer (Eqs. 13-17)
+        c_Q, sel_idx = self.indexer(x, K_I_comp)
+        k = sel_idx.shape[-1]
+
+        # 4. Gather selected compressed KV entries
+        batch_idx = torch.arange(B, device=sel_idx.device).view(B, 1, 1)
+        C_sel = C_comp[batch_idx, sel_idx]                # [B, n, k, c]
+
+        # Block centre positions for RoPE
+        blk_pos = (sel_idx.float() * m + m / 2).long()
+
+        # 5. Sliding window
+        kv_sw, sw_pos, sw_valid = self.sliding_window(x, cfg.n_win)
+
+        # 6. Concatenate
+        KV_all  = torch.cat([C_sel,  kv_sw],  dim=2)
+        pos_all = torch.cat([blk_pos, sw_pos], dim=2)
+
+        # Attention mask (compressed entries invalid for first-block tokens)
+        tok_idx = torch.arange(n, device=H.device)
+        no_comp = (tok_idx // m == 0)
+        comp_ok = (~no_comp).unsqueeze(0).unsqueeze(-1).expand(B, -1, k)
+        attn_mask = torch.cat([comp_ok, sw_valid], dim=2)
+
+        q_pos = torch.arange(n, device=H.device).unsqueeze(0).expand(B, -1)
+
+        # 7. Core attention
+        o = self.core_attn(c_Q, KV_all, pos_all, q_pos, attn_mask)
+
+        # 8. Grouped output projection
+        return self.out_proj(o)       
 class SmearGate(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -432,10 +794,14 @@ class MLP(nn.Module):
             return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, activation="leaky_relu2"):
+    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False, activation="leaky_relu2", use_csa=True):
         super().__init__()
         self.attn_norm, self.mlp_norm = RMSNorm(), RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        if use_csa:
+            cfg = CSAConfig(d=dim, n_h=num_heads)
+            self.attn = CSALayer(cfg)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult, activation=activation)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -445,7 +811,12 @@ class TransformerBlock(nn.Module):
     def forward(self, x, x0, v_embed=None):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+        
+        if isinstance(self.attn, CSALayer):
+            attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
+        else:
+            attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+            
         if self.parallel:
             mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
             return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
@@ -484,9 +855,13 @@ class GPT(nn.Module):
                  qk_gain_init, mtp_num_heads=0, mtp_loss_weight=0.1,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0, rope_dims=0,
                  ln_scale=False, ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 activation="leaky_relu2", softcap_type="poly"):
+                 activation="leaky_relu2", softcap_type="poly",
+                 num_loops=0, loop_start=3, loop_end=5,
+                 self_distil=False, distil_weight=0.3):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)
+        self.self_distil = self_distil
+        self.distil_weight = distil_weight
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -496,14 +871,30 @@ class GPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
+        
+        self.looping_active = False
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        
+        if num_loops > 0:
+            loop_seg = list(range(loop_start, loop_end + 1))
+            all_indices = list(range(loop_start))
+            for _ in range(num_loops + 1): all_indices.extend(loop_seg)
+            all_indices.extend(range(loop_end + 1, num_layers))
+            num_enc = len(all_indices) // 2
+            self.encoder_indices = all_indices[:num_enc]
+            self.decoder_indices = all_indices[num_enc:]
+        else:
+            self.encoder_indices = list(range(self.num_encoder_layers))
+            self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
+            
+        self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, model_dim, dtype=torch.float32))
+        
         self.blocks = nn.ModuleList([
             MambaBlock(model_dim, layer_idx=i, ln_scale=ln_scale) if i % 2 == 0 else
-            TransformerBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i, ln_scale=ln_scale, activation=activation)
+            TransformerBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=i, ln_scale=ln_scale, activation=activation, use_csa=True)
             for i in range(num_layers)
         ])
         if rope_dims > 0:
@@ -576,14 +967,19 @@ class GPT(nn.Module):
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5).to(x.dtype)
         x = self.smear(x)
         x0 = x; skips = []; ve_cache = {}
-        for i in range(self.num_encoder_layers):
+        enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
+        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        
+        for i in enc_iter:
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0, v_embed=ve); skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+        
+        mid_x = x  # the intermediate representation after encoder
+            
+        for skip_idx, bi in enumerate(dec_iter):
             if skips:
-                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(scaled_skip, x, g)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0, v_embed=ve)
@@ -595,6 +991,17 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self._softcap(logits_proj)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        
+        if self.training and self.self_distil:
+            mid_x_flat = mid_x.reshape(-1, mid_x.size(-1))
+            if self.tie_embeddings:
+                mid_logits_proj = F.linear(mid_x_flat, self.tok_emb.weight)
+            else:
+                mid_logits_proj = self.lm_head(mid_x_flat)
+            mid_logits = self._softcap(mid_logits_proj)
+            distil_loss = F.cross_entropy(mid_logits.float(), targets, reduction="mean")
+            main_loss = main_loss + self.distil_weight * distil_loss
+            
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
@@ -616,14 +1023,17 @@ class GPT(nn.Module):
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5).to(x.dtype)
         x = self.smear(x)
         x0 = x; skips = []; ve_cache = {}
-        for i in range(self.num_encoder_layers):
+        enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
+        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+        
+        for i in enc_iter:
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0, v_embed=ve); skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
+            
+        for skip_idx, bi in enumerate(dec_iter):
             if skips:
-                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
+                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
                 x = torch.lerp(scaled_skip, x, g)
             ve = self._get_ve(bi, input_ids, ve_cache)
             x = self.blocks[bi](x, x0, v_embed=ve)
@@ -997,6 +1407,8 @@ def main():
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         activation=args.activation, softcap_type=args.softcap_type,
+        num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
+        self_distil=args.self_distil, distil_weight=args.distil_weight,
     ).to(device).bfloat16()
     for m in base_model.modules():
         if isinstance(m, CastedLinear): m.float()
@@ -1092,6 +1504,10 @@ def main():
         if last_step: break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        frac = elapsed_ms / (args.max_wallclock_seconds * 1000.0)
+        if args.num_loops > 0 and getattr(base_model, 'looping_active', False) == False and frac >= args.enable_looping_at:
+            base_model.looping_active = True
+            log0(f"layer_loop:enabled step:{step} frac:{frac:.3f}")
         scale = lr_mul(step, elapsed_ms)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
             CastedLinear._qat_enabled = True; log0(f"late_qat:enabled step:{step}")
@@ -1159,6 +1575,8 @@ def main():
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         activation=args.activation, softcap_type=args.softcap_type,
+        num_loops=args.num_loops, loop_start=args.loop_start, loop_end=args.loop_end,
+        self_distil=args.self_distil, distil_weight=args.distil_weight,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear): m.float()
